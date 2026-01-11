@@ -1,12 +1,11 @@
 FROM python:3.9-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
     APP_HOME=/app
 
 WORKDIR $APP_HOME
 
-# Install system dependencies for building Python packages (needed for some DB drivers)
+# Install system dependencies (libpq is needed for Postgres)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
