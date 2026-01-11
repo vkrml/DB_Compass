@@ -106,7 +106,8 @@ class SQLAdapter(DatabaseAdapter):
             u = urlparse(uri)
             # Reconstruct URI with new path (database name)
             # This handles postgresql://user:pass@host/old_db -> .../new_db
-            new_uri = u._replace(path=f"/{db_name}")
+            new_path = f"/{db_name}"
+            new_uri = u._replace(path=new_path)
             self.engine = create_engine(urlunparse(new_uri))
         else:
             self.engine = create_engine(uri)
@@ -147,8 +148,13 @@ class SQLAdapter(DatabaseAdapter):
         pk = self.get_pk(table)
         offset = (page - 1) * ROWS_PER_PAGE
         with self.engine.connect() as conn:
-            total = conn.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar()
-            # Convert UUID or other complex types to string automatically via serialization later
+            # Count
+            try:
+                total = conn.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar()
+            except:
+                total = 0
+                
+            # Select
             sql = text(f"SELECT * FROM {table} ORDER BY {pk} DESC LIMIT {ROWS_PER_PAGE} OFFSET {offset}")
             result = conn.execute(sql)
             rows = []
@@ -546,7 +552,8 @@ def list_tables(db_name):
         flash(str(e), 'error')
         return redirect(url_for('dashboard'))
 
-@app.route('/dbs/<db_name>/<table >')
+# FIXED: Removed space in <table >
+@app.route('/dbs/<db_name>/<table>')
 def view_rows(db_name, table):
     adp = get_adapter(db_name)
     page = int(request.args.get('page', 1))
