@@ -1,14 +1,14 @@
 import os
 import json
 import logging
-import math
+import re
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
-from flask import Flask, request, redirect, url_for, session, render_template, flash
+from flask import Flask, request, redirect, url_for, session, render_template, flash, Markup
 from jinja2 import DictLoader
 from bson import json_util, ObjectId
 
-# Drivers
+# Database Drivers
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from sqlalchemy import create_engine, inspect, text
 import redis
@@ -17,14 +17,29 @@ import redis
 # CONFIGURATION
 # ==========================================
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'links4u_secret_key_change_me')
+app.secret_key = os.environ.get('SECRET_KEY', 'links4u_ultimate_key')
 app.jinja_env.globals.update(max=max, min=min, str=str, type=type, len=len, list=list, int=int)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
-ROWS_PER_PAGE = 25
+ROWS_PER_PAGE = 50
 
 # ==========================================
-# ADVANCED DATABASE ADAPTERS
+# UTILITIES
+# ==========================================
+@app.template_filter('highlight')
+def highlight_filter(s, query):
+    if not query or not s: return s
+    # Escape HTML first to prevent injection, then highlight
+    s = str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    pattern = re.compile(re.escape(query), re.IGNORECASE)
+    return Markup(pattern.sub(lambda m: f'<mark class="bg-yellow-500/50 text-white rounded-sm px-0.5">{m.group(0)}</mark>', s))
+
+@app.template_filter('to_json')
+def to_json_filter(value):
+    return json_util.dumps(value, indent=2)
+
+# ==========================================
+# ADAPTERS
 # ==========================================
 class DatabaseAdapter:
     def connect(self, uri, db_name=None): raise NotImplementedError
@@ -46,28 +61,26 @@ class MongoAdapter(DatabaseAdapter):
         return True
 
     def list_databases(self): return sorted(self.client.list_database_names())
-    
     def drop_database(self, db_name): self.client.drop_database(db_name)
-
     def list_tables(self, db_name): return sorted(self.client[db_name].list_collection_names())
-
     def drop_table(self, db_name, table): self.client[db_name].drop_collection(table)
 
     def get_rows(self, db_name, table, page, search=None, sort_col=None, sort_dir='desc'):
         col = self.client[db_name][table]
         query = {}
         
-        # Search Logic (Try to parse JSON, else search ID)
         if search:
             search = search.strip()
-            if search.startswith('{'):
-                try: query = json.loads(search)
-                except: pass
-            else:
-                try: query = {'_id': ObjectId(search)}
-                except: query = {'_id': search}
+            # Deep search using $regex on fields is hard generically. 
+            # We try ID match first, then a "catch-all" if user provides JSON, 
+            # OR we rely on a specific logic. 
+            # For simplicity in this generic tool: Search ID OR try string match on specific known text fields?
+            # Better: $where (slow) or just ID.
+            # PRO APPROACH: We will use regex on the JSON string representation (Client side is easier, but Server side requires $where)
+            # Safe Fallback: Search ID.
+            try: query = {'_id': ObjectId(search)}
+            except: query = {'_id': {'$regex': search, '$options': 'i'}}
 
-        # Sort Logic
         sort_field = sort_col if sort_col else '_id'
         if sort_field == 'id': sort_field = '_id'
         direction = ASCENDING if sort_dir == 'asc' else DESCENDING
@@ -79,6 +92,8 @@ class MongoAdapter(DatabaseAdapter):
         rows = []
         for doc in cursor:
             doc['__id'] = str(doc['_id'])
+            # Add string representation for raw view
+            doc['__raw'] = json_util.dumps(doc) 
             rows.append(doc)
         return rows, total
 
@@ -89,13 +104,11 @@ class MongoAdapter(DatabaseAdapter):
 
     def save_row(self, db_name, table, id, data, is_new):
         col = self.client[db_name][table]
-        if is_new:
-            col.insert_one(data)
+        if is_new: col.insert_one(data)
         else:
             try: oid = ObjectId(id)
             except: oid = id
             if '_id' in data: del data['_id']
-            if '__id' in data: del data['__id']
             col.replace_one({'_id': oid}, data)
 
     def delete_row(self, db_name, table, id):
@@ -116,13 +129,10 @@ class SQLAdapter(DatabaseAdapter):
             if 'channel_binding' in qs: del qs['channel_binding']
             uri = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
         except: pass
-
-        self.base_uri = uri
         
         if db_name:
             u = urlparse(uri)
-            new_path = f"/{db_name}"
-            uri = urlunparse(u._replace(path=new_path))
+            uri = urlunparse(u._replace(path=f"/{db_name}"))
 
         self.engine = create_engine(uri)
         with self.engine.connect() as conn: pass
@@ -138,49 +148,46 @@ class SQLAdapter(DatabaseAdapter):
                 elif dialect == 'mysql':
                     res = conn.execute(text("SHOW DATABASES;"))
                     return sorted([r[0] for r in res])
-                else:
-                    return [urlparse(str(self.engine.url)).database or 'main']
-        except:
-            return [urlparse(str(self.engine.url)).database or 'default']
+                else: return [urlparse(str(self.engine.url)).database or 'main']
+        except: return ['default']
 
     def drop_database(self, db_name):
-        # Dangerous and difficult in SQL without dropping connections. 
-        # For safety/complexity, strictly implemented for specific drivers or skipped.
-        # Implemented for Postgres/MySQL via raw SQL, requires appropriate user permissions.
-        with self.engine.connect() as conn:
-            conn.execute(text("COMMIT")) # Close transaction
+        # NOTE: Dropping DB in SQL usually requires AUTOCOMMIT isolation level
+        # This is a dangerous op, implemented minimally for Postgres
+        if 'postgresql' in self.engine.dialect.name:
+            eng = create_engine(self.engine.url.set(database='postgres'))
+            conn = eng.connect()
+            conn.execution_options(isolation_level="AUTOCOMMIT")
             conn.execute(text(f"DROP DATABASE {db_name}"))
+            conn.close()
 
-    def list_tables(self, db_name):
-        return sorted(inspect(self.engine).get_table_names())
-
-    def drop_table(self, db_name, table):
-        with self.engine.begin() as conn:
-            conn.execute(text(f"DROP TABLE {table}"))
+    def list_tables(self, db_name): return sorted(inspect(self.engine).get_table_names())
+    def drop_table(self, db_name, table): 
+        with self.engine.begin() as conn: conn.execute(text(f"DROP TABLE {table}"))
 
     def get_pk(self, table):
-        insp = inspect(self.engine)
-        pk = insp.get_pk_constraint(table)
-        return pk['constrained_columns'][0] if pk['constrained_columns'] else 'id'
+        try:
+            pk = inspect(self.engine).get_pk_constraint(table)
+            return pk['constrained_columns'][0] if pk['constrained_columns'] else 'id'
+        except: return 'id'
 
     def get_rows(self, db_name, table, page, search=None, sort_col=None, sort_dir='desc'):
         pk = self.get_pk(table)
         sort_field = sort_col if sort_col else pk
-        
-        # Validation to prevent injection on Sort Field
-        insp = inspect(self.engine)
-        cols = [c['name'] for c in insp.get_columns(table)]
-        if sort_field not in cols: sort_field = pk
-
         offset = (page - 1) * ROWS_PER_PAGE
         
         where_clause = ""
         params = {}
         
         if search:
-            # Simple Search: Try to match PK or assume generic text search on PK
-            where_clause = f"WHERE {pk}::text LIKE :search" if 'postgres' in self.engine.dialect.name else f"WHERE {pk} LIKE :search"
-            params['search'] = f"%{search}%"
+            # POSTGRES MAGIC: Convert row to text and search inside
+            if 'postgresql' in self.engine.dialect.name:
+                where_clause = f"WHERE {table}::text ILIKE :search"
+                params['search'] = f"%{search}%"
+            else:
+                # Basic SQL: Search PK only
+                where_clause = f"WHERE {pk} LIKE :search"
+                params['search'] = f"%{search}%"
 
         sql_count = text(f"SELECT COUNT(*) FROM {table} {where_clause}")
         sql_rows = text(f"SELECT * FROM {table} {where_clause} ORDER BY {sort_field} {sort_dir.upper()} LIMIT {ROWS_PER_PAGE} OFFSET {offset}")
@@ -197,6 +204,7 @@ class SQLAdapter(DatabaseAdapter):
                     if hasattr(v, 'isoformat'): d[k] = v.isoformat()
                     if isinstance(v, bytes): d[k] = "<binary>"
                 d['__id'] = str(d.get(pk))
+                d['__raw'] = json.dumps(d, default=str)
                 rows.append(d)
             return rows, total
 
@@ -231,15 +239,11 @@ class SQLAdapter(DatabaseAdapter):
 
 class RedisAdapter(DatabaseAdapter):
     def __init__(self): self.r = None
-    
     def connect(self, uri, db_name=None):
         self.r = redis.from_url(uri, decode_responses=True)
         if db_name:
             try:
-                db_int = int(db_name.replace("DB", "").strip())
-                pool_args = self.r.connection_pool.connection_kwargs.copy()
-                pool_args['db'] = db_int
-                self.r = redis.Redis(**pool_args, decode_responses=True)
+                self.r = redis.Redis(**self.r.connection_pool.connection_kwargs, db=int(db_name.replace("DB", "").strip()), decode_responses=True)
             except: pass
         self.r.ping()
         return True
@@ -255,12 +259,11 @@ class RedisAdapter(DatabaseAdapter):
         total = len(keys)
         start = (page - 1) * ROWS_PER_PAGE
         page_keys = keys[start : start + ROWS_PER_PAGE]
-        
         rows = []
         for k in page_keys:
             t = self.r.type(k)
             v = self.r.get(k) if t == 'string' else f"({t})"
-            rows.append({'__id': k, 'type': t, 'value': v})
+            rows.append({'__id': k, 'type': t, 'value': v, '__raw': json.dumps({'key':k, 'val': v})})
         return rows, total
 
     def get_row(self, db_name, table, id):
@@ -281,7 +284,6 @@ class RedisAdapter(DatabaseAdapter):
             self.r.delete(key)
             self.r.rpush(key, *val)
         else: self.r.set(key, str(val))
-
     def delete_row(self, db_name, table, id): self.r.delete(id)
 
 def get_adapter(db_name=None):
@@ -298,115 +300,103 @@ def get_adapter(db_name=None):
         return None
 
 # ==========================================
-# LINKS4U DB COMPASS UI TEMPLATES
+# UI TEMPLATES
 # ==========================================
 
 BASE_LAYOUT = """
 <!DOCTYPE html>
-<html lang="en" class="h-full bg-stone-50">
+<html lang="en" class="h-full bg-gray-900 text-gray-100 antialiased">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Links4u DB Compass</title>
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+    
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/theme/nord.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/theme/material-darker.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/codemirror.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/mode/javascript/javascript.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.5/mode/sql/sql.min.js"></script>
-    
+
     <script>
         tailwind.config = {
             theme: {
                 extend: {
-                    fontFamily: { sans: ['"Space Grotesk"', 'sans-serif'], mono: ['"JetBrains Mono"', 'monospace'] },
+                    fontFamily: { sans: ['Inter', 'sans-serif'], mono: ['JetBrains Mono', 'monospace'] },
                     colors: { 
-                        brand: { 
-                            bg: '#F5F5F4', 
-                            surface: '#FFFFFF',
-                            primary: '#A3E635', // Lime 400
-                            dark: '#1C1917', // Stone 900
-                            danger: '#EF4444' 
-                        } 
-                    },
-                    boxShadow: { 'neo': '4px 4px 0px 0px #1C1917' }
+                        gray: { 750: '#2d3748', 850: '#1a202c', 900: '#111827', 950: '#0B0F19' },
+                        brand: { 500: '#10B981', 600: '#059669' }
+                    }
                 }
             }
         }
     </script>
     <style>
-        .neo-border { border: 2px solid #1C1917; }
-        .neo-shadow { box-shadow: 4px 4px 0px 0px #1C1917; }
-        .neo-shadow-hover:hover { box-shadow: 6px 6px 0px 0px #1C1917; transform: translate(-2px, -2px); }
-        .neo-shadow-active:active { box-shadow: 2px 2px 0px 0px #1C1917; transform: translate(2px, 2px); }
-        .scrollbar-hide::-webkit-scrollbar { display: none; }
-        .CodeMirror { height: 100%; font-family: 'JetBrains Mono'; font-size: 14px; }
+        .scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+        .scrollbar-thin::-webkit-scrollbar-track { background: #111827; }
+        .scrollbar-thin::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+        .CodeMirror { height: 100%; font-family: 'JetBrains Mono'; font-size: 13px; background: #0B0F19; }
+        mark { color: white; background: #d97706; }
     </style>
 </head>
-<body class="h-full flex flex-col md:flex-row overflow-hidden text-stone-900" x-data="{ sidebarOpen: false }">
+<body class="h-full flex flex-col md:flex-row overflow-hidden" x-data="{ sidebarOpen: false }">
 
-    <header class="md:hidden flex items-center justify-between p-4 border-b-2 border-brand-dark bg-white z-20">
-        <div class="flex items-center gap-2">
-            <div class="w-6 h-6 bg-brand-primary border-2 border-brand-dark"></div>
-            <span class="font-bold text-lg tracking-tight">Links4u <span class="text-stone-500">DB</span></span>
+    <header class="md:hidden flex items-center justify-between p-4 border-b border-gray-800 bg-gray-900 z-20">
+        <div class="flex items-center gap-2 text-brand-500 font-bold">
+            <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
+            <span>L4U Compass</span>
         </div>
-        <button @click="sidebarOpen = !sidebarOpen" class="p-2 neo-border bg-brand-primary">
+        <button @click="sidebarOpen = !sidebarOpen" class="text-gray-400 hover:text-white">
             <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path></svg>
         </button>
     </header>
 
-    <aside :class="sidebarOpen ? 'translate-x-0' : '-translate-x-full'" class="fixed inset-y-0 left-0 z-30 w-72 bg-white border-r-2 border-brand-dark transition-transform duration-300 md:relative md:translate-x-0 flex flex-col">
-        <div class="p-6 border-b-2 border-brand-dark hidden md:flex items-center gap-3">
-            <div class="w-8 h-8 bg-brand-primary border-2 border-brand-dark shadow-[2px_2px_0_0_#000]"></div>
-            <h1 class="font-bold text-xl">Links4u DB</h1>
+    <aside :class="sidebarOpen ? 'translate-x-0' : '-translate-x-full'" class="fixed inset-y-0 left-0 z-30 w-72 bg-gray-950 border-r border-gray-800 transition-transform duration-300 md:relative md:translate-x-0 flex flex-col">
+        <div class="p-5 border-b border-gray-800 hidden md:flex items-center gap-3">
+            <div class="p-1.5 bg-brand-500/20 rounded text-brand-500">
+                <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4" /></svg>
+            </div>
+            <h1 class="font-bold text-gray-100 tracking-tight">Links4u Compass</h1>
         </div>
 
         {% if session.get('db_uri') %}
-        <div class="p-4 bg-stone-100 border-b-2 border-brand-dark">
-            <div class="text-xs font-bold uppercase text-stone-500 mb-1">Status</div>
-            <div class="flex items-center gap-2">
-                <span class="w-3 h-3 rounded-full bg-green-500 border border-black"></span>
-                <span class="font-mono text-sm truncate w-full" title="{{ session.get('db_uri') }}">Connected</span>
+        <nav class="flex-grow overflow-y-auto p-4 space-y-8 scrollbar-thin">
+            <div>
+                <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-3 px-2">Databases</h3>
+                <ul class="space-y-0.5">
+                    {% for db in dbs %}
+                    <li>
+                        <a href="{{ url_for('list_tables', db_name=db) }}" class="flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors {{ 'bg-brand-500/10 text-brand-500 font-medium' if session.get('current_db_name') == db else 'text-gray-400 hover:text-gray-200 hover:bg-gray-800' }}">
+                            <svg class="w-4 h-4 opacity-70" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 01-2 2v4a2 2 0 012 2h14a2 2 0 012-2v-4a2 2 0 01-2-2m-2-4h.01M17 16h.01" /></svg>
+                            <span class="truncate">{{ db }}</span>
+                        </a>
+                    </li>
+                    {% endfor %}
+                </ul>
             </div>
-            <a href="{{ url_for('logout') }}" class="mt-3 block text-center text-xs font-bold text-red-600 hover:underline">DISCONNECT SERVER</a>
+        </nav>
+        <div class="p-4 border-t border-gray-800">
+             <a href="{{ url_for('logout') }}" class="flex items-center justify-center w-full py-2 text-xs font-bold text-red-400 hover:bg-red-500/10 rounded-md transition-colors gap-2">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>
+                DISCONNECT
+             </a>
         </div>
         {% endif %}
-
-        <nav class="flex-grow overflow-y-auto p-4 space-y-6">
-            {% if session.get('db_uri') %}
-                {% if dbs %}
-                <div>
-                    <h3 class="font-bold text-xs uppercase tracking-wider text-stone-400 mb-3">Databases</h3>
-                    <ul class="space-y-2">
-                        {% for db in dbs %}
-                        <li>
-                            <a href="{{ url_for('list_tables', db_name=db) }}" class="flex items-center gap-2 px-3 py-2 border-2 border-transparent hover:border-brand-dark hover:bg-brand-primary/20 rounded transition-all {{ 'bg-brand-primary border-brand-dark font-bold' if session.get('current_db_name') == db else 'text-stone-600' }}">
-                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"></path></svg>
-                                <span class="truncate">{{ db }}</span>
-                            </a>
-                        </li>
-                        {% endfor %}
-                    </ul>
-                </div>
-                {% endif %}
-            {% else %}
-                <div class="text-center p-4 text-stone-500 text-sm">No connection active.</div>
-            {% endif %}
-        </nav>
     </aside>
 
-    <div x-show="sidebarOpen" @click="sidebarOpen = false" class="fixed inset-0 bg-black/50 z-20 md:hidden"></div>
+    <div x-show="sidebarOpen" @click="sidebarOpen = false" class="fixed inset-0 bg-black/80 z-20 md:hidden backdrop-blur-sm"></div>
 
-    <main class="flex-grow flex flex-col h-full overflow-hidden relative bg-stone-50">
+    <main class="flex-grow flex flex-col h-full overflow-hidden relative bg-gray-900">
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}
-            <div class="absolute top-4 right-4 z-50 w-full max-w-sm space-y-2">
+            <div class="absolute top-6 right-6 z-50 w-full max-w-sm space-y-2 pointer-events-none">
                 {% for category, message in messages %}
-                <div class="neo-border neo-shadow p-3 flex justify-between items-center {{ 'bg-red-100 text-red-800' if category == 'error' else 'bg-green-100 text-green-800' }}">
-                    <span class="font-bold text-sm">{{ message }}</span>
-                    <button onclick="this.parentElement.remove()" class="font-bold text-xl">&times;</button>
+                <div class="pointer-events-auto shadow-lg rounded-lg p-4 border flex justify-between items-start {{ 'bg-red-900/90 border-red-700 text-red-100' if category == 'error' else 'bg-green-900/90 border-green-700 text-green-100' }}">
+                    <span class="text-sm font-medium">{{ message }}</span>
+                    <button onclick="this.parentElement.remove()" class="text-white/60 hover:text-white">&times;</button>
                 </div>
                 {% endfor %}
             </div>
@@ -422,25 +412,30 @@ BASE_LAYOUT = """
 LOGIN_TEMPLATE = """
 {% extends 'base.html' %}
 {% block content %}
-<div class="h-full flex items-center justify-center p-4 bg-stone-50">
-    <div class="w-full max-w-lg bg-white neo-border neo-shadow p-8">
-        <h1 class="text-4xl font-bold mb-2">Connect Database</h1>
-        <p class="text-stone-500 mb-8">Links4u DB Compass Gateway</p>
+<div class="h-full flex items-center justify-center p-4">
+    <div class="w-full max-w-md">
+        <div class="text-center mb-10">
+            <h1 class="text-3xl font-bold text-white mb-2">Welcome Back</h1>
+            <p class="text-gray-500">Enter your connection string to access your data.</p>
+        </div>
         
         <form method="POST" action="{{ url_for('connect_db') }}" class="space-y-6">
             <div>
-                <label class="block font-bold text-sm mb-2 uppercase">Connection String (URI)</label>
-                <input type="text" name="db_uri" placeholder="postgresql://user:pass@host/db" required
-                       class="w-full p-4 neo-border bg-stone-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-brand-primary font-mono text-sm">
+                <div class="relative">
+                    <input type="text" name="db_uri" placeholder="postgresql://... or mongodb://..." required autofocus
+                           class="w-full bg-gray-950 border border-gray-700 text-white p-4 rounded-lg focus:ring-2 focus:ring-brand-500 focus:border-transparent outline-none font-mono text-sm shadow-xl transition-all">
+                </div>
             </div>
-            
-            <div class="flex gap-4 text-xs font-mono text-stone-400">
-                <span>MONGODB</span> &bull; <span>POSTGRES</span> &bull; <span>MYSQL</span> &bull; <span>REDIS</span>
-            </div>
-
-            <button type="submit" class="w-full py-4 bg-brand-dark text-white font-bold tracking-widest hover:bg-brand-primary hover:text-brand-dark neo-border transition-colors">
-                INITIALIZE CONNECTION &rarr;
+            <button type="submit" class="w-full py-3.5 bg-brand-600 hover:bg-brand-500 text-white font-bold rounded-lg shadow-lg shadow-brand-500/20 transition-all transform hover:scale-[1.01]">
+                Connect Database
             </button>
+            
+            <div class="grid grid-cols-4 gap-2 text-[10px] font-mono text-gray-600 uppercase text-center mt-8">
+                <span class="bg-gray-800/50 py-1 rounded">Postgres</span>
+                <span class="bg-gray-800/50 py-1 rounded">Mongo</span>
+                <span class="bg-gray-800/50 py-1 rounded">MySQL</span>
+                <span class="bg-gray-800/50 py-1 rounded">Redis</span>
+            </div>
         </form>
     </div>
 </div>
@@ -450,36 +445,40 @@ LOGIN_TEMPLATE = """
 TABLES_TEMPLATE = """
 {% extends 'base.html' %}
 {% block content %}
-<div class="h-full flex flex-col p-6 overflow-hidden">
-    <div class="flex justify-between items-end mb-6 border-b-2 border-stone-200 pb-4 shrink-0">
+<div class="h-full flex flex-col">
+    <div class="border-b border-gray-800 p-6 flex justify-between items-center bg-gray-900">
         <div>
-            <div class="text-xs font-bold text-stone-400 uppercase tracking-widest mb-1">Database</div>
-            <h2 class="text-3xl font-bold">{{ db_name }}</h2>
+            <div class="text-xs font-bold text-gray-500 uppercase tracking-widest mb-1">Database Scope</div>
+            <h2 class="text-2xl font-bold text-white">{{ db_name }}</h2>
         </div>
-        <form action="{{ url_for('drop_database_route', db_name=db_name) }}" method="POST" onsubmit="return confirm('CRITICAL WARNING: This will permanently DELETE the entire database {{ db_name }}. Are you sure?');">
-            <button class="text-red-500 font-bold text-xs hover:bg-red-50 px-3 py-1 neo-border border-transparent hover:border-red-500">DELETE DATABASE</button>
+        <form action="{{ url_for('drop_database_route', db_name=db_name) }}" method="POST" onsubmit="return confirm('CRITICAL: Irreversible deletion of database {{ db_name }}. Confirm?');">
+            <button class="text-xs font-bold text-red-500 hover:text-red-400 hover:bg-red-500/10 px-4 py-2 rounded-md transition-colors">
+                DELETE DATABASE
+            </button>
         </form>
     </div>
 
-    <div class="flex-grow overflow-y-auto pr-2">
+    <div class="flex-grow overflow-y-auto p-6 scrollbar-thin">
         {% if tables %}
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
             {% for table in tables %}
-            <a href="{{ url_for('view_rows', db_name=db_name, table=table) }}" class="block bg-white neo-border p-6 hover:bg-brand-primary/10 transition-transform hover:-translate-y-1 hover:shadow-[4px_4px_0_0_#000] group relative">
-                <div class="flex justify-between items-start">
-                    <div class="w-10 h-10 bg-brand-primary neo-border flex items-center justify-center mb-4 group-hover:bg-white transition-colors">
-                        <span class="font-bold text-lg">{{ table[0] | upper }}</span>
-                    </div>
-                    <span class="opacity-0 group-hover:opacity-100 transition-opacity text-xl">&rarr;</span>
+            <a href="{{ url_for('view_rows', db_name=db_name, table=table) }}" class="group bg-gray-800/50 border border-gray-800 hover:border-brand-500/50 hover:bg-gray-800 p-5 rounded-xl transition-all relative overflow-hidden">
+                <div class="absolute top-0 right-0 p-4 opacity-0 group-hover:opacity-100 transition-opacity text-brand-500">
+                    <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3" /></svg>
                 </div>
-                <h3 class="font-bold text-lg truncate">{{ table }}</h3>
-                <p class="text-xs text-stone-400 font-mono mt-1">Collection / Table</p>
+                <div class="flex items-center gap-3 mb-3">
+                    <div class="p-2 bg-gray-900 rounded-lg text-gray-400 group-hover:text-brand-500 transition-colors">
+                        <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+                    </div>
+                </div>
+                <h3 class="font-bold text-gray-200 truncate pr-6">{{ table }}</h3>
+                <p class="text-xs text-gray-500 font-mono mt-1">Table / Collection</p>
             </a>
             {% endfor %}
         </div>
         {% else %}
-        <div class="h-64 flex flex-col items-center justify-center neo-border border-dashed bg-stone-100">
-            <p class="text-stone-400 font-bold text-lg">No Tables Found</p>
+        <div class="h-64 flex flex-col items-center justify-center border-2 border-dashed border-gray-800 rounded-xl">
+            <p class="text-gray-600 font-medium">No Tables Found</p>
         </div>
         {% endif %}
     </div>
@@ -490,81 +489,100 @@ TABLES_TEMPLATE = """
 ROWS_TEMPLATE = """
 {% extends 'base.html' %}
 {% block content %}
-<div class="h-full flex flex-col bg-white">
-    <div class="border-b-2 border-brand-dark p-4 bg-stone-50 flex flex-col md:flex-row gap-4 justify-between items-center shrink-0">
-        <div class="flex items-center gap-4 w-full md:w-auto">
-            <h2 class="font-bold text-xl flex items-center gap-2">
-                <span class="text-stone-400">{{ db_name }} /</span> {{ table }}
-            </h2>
+<div class="h-full flex flex-col bg-gray-950" x-data="{ rawMode: false, currentRaw: '' }">
+    <div class="border-b border-gray-800 p-4 bg-gray-900 flex flex-col md:flex-row gap-4 justify-between items-center shrink-0">
+        <div class="flex items-center gap-3 w-full md:w-auto overflow-hidden">
+            <a href="{{ url_for('list_tables', db_name=db_name) }}" class="text-gray-500 hover:text-white transition-colors">
+                <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18" /></svg>
+            </a>
+            <h2 class="font-bold text-lg text-white truncate"><span class="text-gray-500">{{ db_name }} /</span> {{ table }}</h2>
         </div>
         
         <div class="flex gap-2 w-full md:w-auto">
-            <form method="GET" class="flex w-full md:w-80">
-                <input type="text" name="q" value="{{ request.args.get('q', '') }}" placeholder="Search ID or Value..." class="w-full px-3 py-2 neo-border border-r-0 focus:outline-none font-mono text-sm">
-                <button type="submit" class="px-4 bg-brand-dark text-white neo-border hover:bg-brand-primary hover:text-black">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
-                </button>
+            <form method="GET" class="flex w-full md:w-96 relative">
+                <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                    <svg class="h-4 w-4 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+                </div>
+                <input type="text" name="q" value="{{ request.args.get('q', '') }}" placeholder="Deep Search (ID or Content)..." 
+                       class="w-full bg-gray-950 border border-gray-700 text-gray-200 pl-10 pr-4 py-2 rounded-l-md focus:ring-1 focus:ring-brand-500 focus:border-brand-500 outline-none text-sm font-mono">
+                <button type="submit" class="px-4 bg-gray-800 border border-l-0 border-gray-700 rounded-r-md hover:bg-gray-700 text-gray-300 text-xs font-bold uppercase">Search</button>
             </form>
             
-            <a href="{{ url_for('edit_row', db_name=db_name, table=table, id='new') }}" class="px-4 py-2 bg-brand-primary neo-border font-bold hover:bg-brand-primary/80 whitespace-nowrap">+ NEW</a>
+            <button @click="rawMode = !rawMode" class="px-3 py-2 bg-gray-800 border border-gray-700 rounded-md text-gray-300 hover:text-white text-xs font-bold uppercase transition-colors" x-text="rawMode ? 'View Table' : 'View Raw'"></button>
             
-            <form action="{{ url_for('drop_table_route', db_name=db_name, table=table) }}" method="POST" onsubmit="return confirm('Delete table {{ table }}?');">
-                <button class="h-full px-3 bg-red-100 text-red-600 neo-border hover:bg-red-500 hover:text-white" title="Delete Table">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
-                </button>
-            </form>
+            <a href="{{ url_for('edit_row', db_name=db_name, table=table, id='new') }}" class="px-4 py-2 bg-brand-600 hover:bg-brand-500 text-white rounded-md text-sm font-bold shadow-lg shadow-brand-500/20 transition-colors flex items-center gap-1">
+                <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg> New
+            </a>
         </div>
     </div>
 
-    <div class="flex-grow overflow-auto bg-stone-100 p-4">
-        <div class="bg-white neo-border min-w-[800px]">
-            <table class="w-full text-left border-collapse">
-                <thead class="bg-stone-50 text-xs uppercase font-bold sticky top-0 z-10">
+    <div class="flex-grow overflow-auto relative bg-gray-950 scrollbar-thin">
+        
+        <div x-show="!rawMode" class="min-w-full inline-block align-middle">
+            <table class="min-w-full divide-y divide-gray-800">
+                <thead class="bg-gray-900 sticky top-0 z-10">
                     <tr>
-                        <th class="p-3 border-b-2 border-brand-dark w-32">Controls</th>
-                        <th class="p-3 border-b-2 border-brand-dark w-48 hover:bg-stone-200 cursor-pointer" onclick="updateSort('id')">
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-24">Action</th>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-48 cursor-pointer hover:text-white" onclick="updateSort('id')">
                             ID {{ '↓' if sort_col == 'id' and sort_dir == 'desc' else '↑' if sort_col == 'id' else '' }}
                         </th>
-                        <th class="p-3 border-b-2 border-brand-dark">
-                            Document / Row Data
-                        </th>
+                        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Document Data</th>
                     </tr>
                 </thead>
-                <tbody class="divide-y divide-stone-200 font-mono text-sm">
+                <tbody class="divide-y divide-gray-800 bg-gray-950">
                     {% for row in rows %}
-                    <tr class="hover:bg-brand-primary/5 group">
-                        <td class="p-3 border-r border-stone-200 bg-white group-hover:bg-transparent">
-                            <div class="flex gap-2">
-                                <a href="{{ url_for('edit_row', db_name=db_name, table=table, id=row['__id']) }}" class="px-2 py-1 neo-border text-xs font-bold hover:bg-black hover:text-white transition-colors">EDIT</a>
+                    <tr class="hover:bg-gray-900/50 group transition-colors">
+                        <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                            <div class="flex items-center gap-3 opacity-60 group-hover:opacity-100 transition-opacity">
+                                <a href="{{ url_for('edit_row', db_name=db_name, table=table, id=row['__id']) }}" class="text-brand-500 hover:text-brand-400">
+                                    <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
+                                </a>
                                 <form method="POST" action="{{ url_for('delete_row', db_name=db_name, table=table, id=row['__id']) }}" onsubmit="return confirm('Delete row?');">
-                                    <button class="px-2 py-1 neo-border border-red-200 text-red-500 text-xs font-bold hover:bg-red-500 hover:text-white hover:border-red-500 transition-colors">DEL</button>
+                                    <button class="text-red-500 hover:text-red-400">
+                                        <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                                    </button>
                                 </form>
+                                <button @click="copyToClipboard('{{ row['__raw'] | replace("'", "\\'") }}')" class="text-gray-500 hover:text-white" title="Copy JSON">
+                                    <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+                                </button>
                             </div>
                         </td>
-                        <td class="p-3 border-r border-stone-200 align-top font-bold text-stone-600 truncate max-w-[150px]" title="{{ row['__id'] }}">
-                            {{ row['__id'] }}
+                        <td class="px-6 py-4 whitespace-nowrap text-sm font-mono text-gray-400">
+                            {{ row['__id'] | highlight(request.args.get('q')) }}
                         </td>
-                        <td class="p-3 align-top text-stone-500 break-all">
-                            {{ row | to_json_preview | truncate(300) }}
+                        <td class="px-6 py-4 text-sm text-gray-400 font-mono break-all leading-relaxed">
+                            <div class="max-h-20 overflow-hidden relative group-hover:max-h-full transition-all duration-500">
+                                {{ row | to_json | highlight(request.args.get('q')) }}
+                            </div>
                         </td>
                     </tr>
                     {% else %}
-                    <tr><td colspan="3" class="p-8 text-center text-stone-400 font-bold">No Records Found</td></tr>
+                    <tr><td colspan="3" class="px-6 py-12 text-center text-gray-500 font-medium">No Records Found matching your criteria.</td></tr>
                     {% endfor %}
                 </tbody>
             </table>
         </div>
+
+        <div x-show="rawMode" class="p-6 space-y-4">
+            {% for row in rows %}
+            <div class="bg-gray-900 border border-gray-800 rounded-lg p-4 font-mono text-xs text-gray-300 overflow-x-auto relative group">
+                <button @click="copyToClipboard('{{ row['__raw'] | replace("'", "\\'") }}')" class="absolute top-2 right-2 p-2 bg-gray-800 rounded text-gray-400 hover:text-white opacity-0 group-hover:opacity-100 transition-opacity">Copy</button>
+                <pre>{{ row['__raw'] }}</pre>
+            </div>
+            {% endfor %}
+        </div>
+
     </div>
 
-    <div class="p-4 border-t-2 border-brand-dark bg-white flex justify-between items-center shrink-0">
-        <div class="text-xs font-bold uppercase text-stone-500">Total: {{ total }} records</div>
+    <div class="p-4 border-t border-gray-800 bg-gray-900 flex justify-between items-center text-sm shrink-0">
+        <div class="text-gray-500">Showing <span class="font-bold text-white">{{ rows|length }}</span> of <span class="font-bold text-white">{{ total }}</span></div>
         <div class="flex gap-2">
             {% if page > 1 %}
-            <a href="?page={{ page - 1 }}&q={{ request.args.get('q','') }}&sort={{ sort_col }}&dir={{ sort_dir }}" class="px-3 py-1 neo-border text-sm font-bold hover:bg-stone-100">&larr; PREV</a>
+            <a href="?page={{ page - 1 }}&q={{ request.args.get('q','') }}&sort={{ sort_col }}&dir={{ sort_dir }}" class="px-3 py-1 bg-gray-800 rounded border border-gray-700 hover:border-gray-500 text-gray-300">Previous</a>
             {% endif %}
-            <span class="px-3 py-1 neo-border bg-brand-dark text-white text-sm font-bold">{{ page }}</span>
-            {% if total > page * 25 %}
-            <a href="?page={{ page + 1 }}&q={{ request.args.get('q','') }}&sort={{ sort_col }}&dir={{ sort_dir }}" class="px-3 py-1 neo-border text-sm font-bold hover:bg-stone-100">NEXT &rarr;</a>
+            <span class="px-3 py-1 text-gray-500 font-mono">Page {{ page }}</span>
+            {% if total > page * 50 %}
+            <a href="?page={{ page + 1 }}&q={{ request.args.get('q','') }}&sort={{ sort_col }}&dir={{ sort_dir }}" class="px-3 py-1 bg-gray-800 rounded border border-gray-700 hover:border-gray-500 text-gray-300">Next</a>
             {% endif %}
         </div>
     </div>
@@ -572,12 +590,16 @@ ROWS_TEMPLATE = """
 
 <script>
 function updateSort(col) {
-    const currentUrl = new URL(window.location.href);
-    const currentDir = currentUrl.searchParams.get('dir');
-    const newDir = (currentDir === 'asc') ? 'desc' : 'asc';
-    currentUrl.searchParams.set('sort', col);
-    currentUrl.searchParams.set('dir', newDir);
-    window.location.href = currentUrl.toString();
+    const url = new URL(window.location);
+    url.searchParams.set('sort', col);
+    url.searchParams.set('dir', url.searchParams.get('dir') === 'asc' ? 'desc' : 'asc');
+    window.location = url;
+}
+function copyToClipboard(text) {
+    navigator.clipboard.writeText(text).then(() => {
+        // Simple toast could go here, but for now we trust the action
+        alert("Copied to clipboard!"); 
+    });
 }
 </script>
 {% endblock %}
@@ -586,16 +608,16 @@ function updateSort(col) {
 EDITOR_TEMPLATE = """
 {% extends 'base.html' %}
 {% block content %}
-<div class="h-full flex flex-col">
-    <div class="p-4 border-b-2 border-brand-dark bg-white flex justify-between items-center shrink-0">
+<div class="h-full flex flex-col bg-gray-950">
+    <div class="p-4 border-b border-gray-800 bg-gray-900 flex justify-between items-center shrink-0">
         <div>
-            <div class="text-xs font-bold text-stone-400 uppercase">MODE: JSON EDITOR</div>
-            <h2 class="font-bold text-2xl">{{ 'New Record' if id == 'new' else 'Edit Record' }}</h2>
+            <div class="text-xs font-bold text-brand-500 uppercase tracking-wide">JSON Editor</div>
+            <h2 class="font-bold text-xl text-white">{{ 'Create Record' if id == 'new' else 'Edit Record' }}</h2>
         </div>
         <div class="flex gap-3">
-            <a href="{{ url_for('view_rows', db_name=db_name, table=table) }}" class="px-4 py-2 font-bold text-stone-500 hover:text-black">CANCEL</a>
-            <button onclick="document.getElementById('saveForm').submit()" class="px-6 py-2 bg-brand-primary neo-border font-bold hover:shadow-[4px_4px_0_0_#000] hover:-translate-y-1 transition-all">
-                SAVE CHANGES
+            <a href="{{ url_for('view_rows', db_name=db_name, table=table) }}" class="px-4 py-2 text-sm font-bold text-gray-400 hover:text-white transition-colors">Cancel</a>
+            <button onclick="document.getElementById('saveForm').submit()" class="px-6 py-2 bg-brand-600 hover:bg-brand-500 text-white rounded-md text-sm font-bold shadow-lg shadow-brand-500/20 transition-all">
+                Save Changes
             </button>
         </div>
     </div>
@@ -611,12 +633,13 @@ EDITOR_TEMPLATE = """
     var editor = CodeMirror.fromTextArea(document.getElementById("json-editor"), {
         lineNumbers: true,
         mode: "application/json",
-        theme: "nord",
+        theme: "material-darker",
         matchBrackets: true,
         autoCloseBrackets: true,
         lint: true,
         smartIndent: true,
-        tabSize: 2
+        tabSize: 2,
+        extraKeys: {"Ctrl-S": function(cm){ document.getElementById('saveForm').submit(); }}
     });
 </script>
 {% endblock %}
@@ -631,16 +654,14 @@ template_dict = {
 }
 app.jinja_loader = DictLoader(template_dict)
 
-@app.template_filter('to_json_preview')
-def to_json_preview(value): return json_util.dumps(value)
+@app.template_filter('to_json')
+def to_json_filter_global(value): return json_util.dumps(value, indent=None)
 
 # ==========================================
-# ROUTING CONTROLLER
+# ROUTES
 # ==========================================
-
 @app.context_processor
 def inject_dbs():
-    # Inject database list into sidebar for every authenticated request
     if session.get('db_uri'):
         try:
             adp = get_adapter()
@@ -651,7 +672,6 @@ def inject_dbs():
 @app.route('/')
 def index():
     if session.get('db_uri'): 
-        # Redirect to first available database if none selected, or dashboard
         return redirect(url_for('list_tables', db_name=session.get('current_db_name', 'postgres')))
     return render_template('login.html')
 
@@ -665,7 +685,7 @@ def connect_db():
         default_db = dbs[0] if dbs else 'default'
         return redirect(url_for('list_tables', db_name=default_db))
     session.pop('db_uri', None)
-    flash('Connection Failed. Check URL.', 'error')
+    flash('Connection Failed. Check your URL.', 'error')
     return redirect(url_for('index'))
 
 @app.route('/logout')
@@ -703,24 +723,12 @@ def view_rows(db_name, table):
     search = request.args.get('q', None)
     sort_col = request.args.get('sort', None)
     sort_dir = request.args.get('dir', 'desc')
-    
     try:
         rows, total = adp.get_rows(db_name, table, page, search, sort_col, sort_dir)
         return render_template('rows.html', db_name=db_name, table=table, rows=rows, total=total, page=page, sort_col=sort_col, sort_dir=sort_dir)
     except Exception as e:
         flash(str(e), 'error')
         return redirect(url_for('list_tables', db_name=db_name))
-
-@app.route('/compass/<db_name>/<table>/drop', methods=['POST'])
-def drop_table_route(db_name, table):
-    adp = get_adapter(db_name)
-    try:
-        adp.drop_table(db_name, table)
-        flash(f"Table {table} deleted.", 'success')
-        return redirect(url_for('list_tables', db_name=db_name))
-    except Exception as e:
-        flash(f"Error: {str(e)}", 'error')
-        return redirect(url_for('view_rows', db_name=db_name, table=table))
 
 @app.route('/compass/<db_name>/<table>/<id>/edit', methods=['GET', 'POST'])
 def edit_row(db_name, table, id):
@@ -738,7 +746,6 @@ def edit_row(db_name, table, id):
     if id != 'new':
         row = adp.get_row(db_name, table, id)
         if row: data_str = json_util.dumps(row, indent=2)
-    
     return render_template('editor.html', db_name=db_name, table=table, id=id, data=data_str)
 
 @app.route('/compass/<db_name>/<table>/<id>/delete', methods=['POST'])
